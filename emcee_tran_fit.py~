@@ -1,0 +1,218 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+from __future__ import print_function
+import emcee
+import corner
+import numpy as np
+import scipy.optimize as op
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+import corner
+from os.path import expanduser
+import os
+import sys
+from scipy import stats
+import batman
+from tqdm import tqdm
+from time import sleep
+
+
+home=expanduser('~')
+
+
+def lnprior(theta):
+	if fix_ecc:
+		P,Tc,ars,rprs,inc= theta
+		b=(ars*np.cos(np.radians(inc)))
+	else:
+		P,Tc,ars,rprs,inc, ecc,w = theta
+		b=(ars*np.cos(np.radians(inc)))*((1-ecc**2)/(1+ecc*np.sin(np.radians(w))))
+
+	loga=np.log10(ars)
+	logrp=np.log10(rprs)
+
+	if 0<b<1 and 42.2 < P < 42.4 and 0<loga<2 and -2.5<rprs<-1 and 133<Tc<135:
+		if not fix_ecc:
+			lnp_ecc=-0.5*(ecc-0.0)**2/(0.02**2)
+			lnp_w=-0.5*(w-90)**2/(1.1**2)
+			lnp=lnp+lnp_e+lnp_w
+			return lnp
+		else:
+			return 0.0
+	else:
+		return -np.inf	
+	
+def lnlike(theta, time, lc, elc):
+	if fix_ecc:
+		P,Tc,ars,rprs,inc = theta
+	else:
+		P,Tc,ars,rprs,inc,e,w = theta
+	model =get_tran(theta,time)
+
+	inv_sigma2 = 1.0/(elc**2)
+	return -0.5*(np.sum((lc-model)**2*inv_sigma2 - np.log(inv_sigma2)))
+
+
+def lnprob(theta, time, lc, elc):
+	lp = lnprior(theta)
+	if not np.isfinite(lp):
+		return -np.inf
+	return lp + lnlike(theta, time, lc, elc)
+	#return lnlike(theta,time,lc,elc)
+
+def get_tran(para,time):
+	if fix_ecc:
+		P,Tc,ars,rprs,inc = para
+	else:
+		P,Tc,ars,rprs,inc,e,w = para
+	params.t0 = Tc 				#time of inferior conjunction 
+	params.per = P				#orbital period	
+	params.rp = rprs				#planet radius (in units of stellar radii)
+	params.a = ars				#semi-major axis (in units of stellar radii)
+	params.inc = inc			#orbital inclination (in degrees)	
+	params.u = [0.5839,0.1359] 	      	        #limb darkening coefficients
+	params.limb_dark = "quadratic"          #limb darkening model
+	if fix_ecc:
+		params.ecc = 0.0				#eccentricity	
+		params.w = 90.0				#longitude of periastron (in degrees) 
+	else:
+		params.e=e
+		params.w=w
+
+	m=batman.TransitModel(params,time)#,supersample_factor=5, exp_time=0.5/24.)
+	model=m.light_curve(params)
+	model=(1e6*(model-1))
+	return model
+
+def fold(time,period,T0):
+	return (((time-T0)/(period)) + 0.5)%1 -0.5
+
+
+
+loc= home+'/Dropbox/PhD/Year_3/Year_3_koi6194_kic9145861/Tran_fit'
+
+
+if not os.path.isdir(loc):
+   os.makedirs(loc)
+
+
+params = batman.TransitParams()
+time,lc,elc,_=np.loadtxt('Detrended_phase0.2.txt',unpack=True,delimiter=' ')
+idx=np.argsort(time)
+time=time[idx]
+lc=lc[idx]
+elc=elc[idx]
+
+time=time.astype(float)
+fix_ecc=False
+labels=['P','Tc','a/R','Rp/R','inc','e','w']
+initial=[42.295,133.8944,18,0.0145,88,0.0,90]
+if fix_ecc:
+	labels=labels[:-2]
+	initial=initial[:-2]
+
+phase=fold(time,initial[0],initial[1])
+idx=np.argsort(phase)
+plt.plot(phase[idx],lc[idx],'k.')
+plt.show()
+
+plt.plot(time,lc,'k.',alpha=0.4)
+#plt.plot(time,get_tran(initial,time),'.')
+plt.plot(time,get_tran(initial,time))
+plt.savefig(loc+"/initial.png")
+
+plt.show()
+
+
+ntemps, nwalkers, niter, ndim = 2, 50, 1000, int(len(labels))
+sampler = emcee.PTSampler(ntemps, nwalkers, ndim, lnlike, lnprior, loglargs=(time, lc, elc))
+burnin=int(niter/2)
+
+p0 = np.zeros([ntemps, nwalkers, ndim])
+for i in range(ntemps):
+    for j in range(nwalkers):
+	p0[i,j,:] = initial + 1e-3*np.random.randn(ndim)
+
+print('... burning in ...')
+for p, lnprob, lnlike in tqdm(sampler.sample(p0, iterations=niter),total=niter):
+	sleep(0.01)
+
+
+# Clear and run the production chain.
+#sampler.reset()
+
+print('... running sampler ...')
+for p, lnprob, lnlike in tqdm(sampler.sample(p, lnprob0=lnprob,
+				                  lnlike0=lnlike,
+				                  iterations=niter),total=niter):
+	
+	sleep(0.001)
+
+
+fig, axes = plt.subplots(len(labels), 1, sharex=True, figsize=(8, 9))
+
+for i in range(0,len(initial)):
+	axes[i].plot(sampler.chain[0, :, :, i].T, color="k", alpha=0.4)
+	axes[i].yaxis.set_major_locator(MaxNLocator(5))
+	axes[i].set_ylabel(labels[i])
+
+fig.tight_layout(h_pad=0.0)
+fig.savefig(loc+"/chain.png")
+plt.close(fig)
+#print('n temps:', ntemps, "log evidence: ", sampler.thermodynamic_integration_log_evidence())
+
+# Make the corner plot.
+samples = sampler.chain[0, :, burnin:, :].reshape((-1, ndim))
+
+
+fig = corner.corner(samples, labels=labels)
+fig.savefig(loc+"/corner.png")
+plt.close(fig)
+
+quantiles = np.percentile(samples,[16,50,84],axis=0).T 
+medians,uerr,lerr=quantiles[:,1],quantiles[:,2]-quantiles[:,1],quantiles[:,1]-quantiles[:,0]#median,+/-
+np.savetxt('TRAN_results.txt',np.c_[np.array(labels),medians,uerr,lerr],fmt='%s',header='Param,median,uerr,lerr')
+for i in range(0,len(labels)):
+	print(labels[i],medians[i],'+/-',np.mean((uerr[i],lerr[i])))
+
+if fix_ecc:
+	P,Tc,ars,rprs,inc = medians
+else:
+	P,Tc,ars,rprs,inc,e,w = medians
+
+
+def fold(time, period, origo=0.0, shift=0.0):
+    return ((time - origo)/period + shift) % 1.
+
+start=get_tran(initial,time)
+final=get_tran(medians,time)
+
+plt.subplot(211)
+plt.plot(time,lc,'k.',alpha=0.4)
+plt.plot(time,start)
+plt.plot(time,final)
+
+phase=fold(time,P,Tc,0.5)-0.5
+idx=np.argsort(phase)
+
+
+def rebin(x, r):
+    m = len(x) // r
+    return x[:m*r].reshape((m,r)).mean(axis=1),r
+
+ph=rebin(phase[idx],500)[0]
+lcr=rebin(lc[idx],500)[0]
+
+
+plt.subplot(212)
+plt.plot(phase,lc,'k,',alpha=0.1)
+plt.plot(phase[idx],final[idx],'r--',lw=2)
+plt.plot(ph,lcr,'b+',alpha=0.3)
+plt.savefig(loc+'/final.png')
+plt.show()
+
+
+
+
+
+

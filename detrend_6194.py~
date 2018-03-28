@@ -1,0 +1,271 @@
+from __future__ import division,print_function
+import numpy as np
+import scipy
+from scipy import stats
+from scipy import interpolate
+import scipy.optimize
+import sys
+import os
+from os.path import expanduser
+import pyfits
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+import fnmatch
+import gatspy.periodic as gp
+from emcee import autocorr
+import batman
+from pybls import BLS
+
+def rebin(x, r):
+    m = len(x) // r
+    return x[:m*r].reshape((m,r)).mean(axis=1),r
+
+
+def med_filt(x, y, dt):
+    """
+    De-trend a light curve using a windowed median.
+    """
+    x, y = np.atleast_1d(x), np.atleast_1d(y)
+    assert len(x) == len(y)
+    r = np.empty(len(y))
+    for i, t in enumerate(x):
+        inds = (x >= t - 0.5 * dt) * (x <= t + 0.5 * dt)
+        r[i] = np.nanmedian(y[inds])
+    return r
+
+def ps(time,flux,Nf=1):
+	time=time-time[0]
+	if time[1]<1:
+		time=time*86400
+
+	c=[]
+	for i in range(len(time)-1):
+		c.append(time[i+1]-time[i])
+	c=np.median(c)
+	#print(c)
+	nyq=1/(2*(time[1]-time[0]))
+	nyq=1/(2*c)
+	#print(nyq*1e6)
+	df=1/time[-1]
+
+	f,p=gp.lomb_scargle_fast.lomb_scargle_fast(time,flux,f0=0,df=df,Nf=Nf*(nyq/df))
+	lhs=(1/len(time))*np.sum(flux**2) 
+	rhs= np.sum(p)
+	ratio=lhs/rhs
+	p*=ratio/(df*1e6)#ppm^2/uHz
+	f*=1e6
+	return f,p
+
+def sigclip(time,flux,eflux,sigma=3,repeat=False):
+	idx=np.ones(len(time))
+	if repeat==True:
+		loop=0
+		while len(idx)>0:
+			idx=np.where(flux>sigma*np.std(flux))[0]
+			flux=np.delete(flux,idx,axis=0)
+			eflux=np.delete(eflux,idx,axis=0)
+			time=np.delete(time,idx,axis=0)
+			loop+=1
+	else:
+		idx=np.where(np.abs(flux)>sigma*np.std(flux))[0]
+		flux=np.delete(flux,idx,axis=0)
+		eflux=np.delete(eflux,idx,axis=0)
+		time=np.delete(time,idx,axis=0)
+
+	return time, flux, eflux
+
+def rebin(x, r):
+    m = len(x) // r
+    return x[:m*r].reshape((m,r)).mean(axis=1),r
+
+
+def detrend(mypath,start=0,end=None,median=True,dt=10.,clip=True,fits=False,ktwo=False,sc=False):
+	lc=[]
+	if fits==True:
+		for file in os.listdir(mypath):
+			if ktwo==True:
+				if fnmatch.fnmatch(file, '*ktwo**.fits'):
+					lc.append(file)
+			else:
+				if fnmatch.fnmatch(file, '*kplr**.fits'):
+					lc.append(file)
+	else:
+		for file in os.listdir(mypath):
+			if ktwo==True:
+				if fnmatch.fnmatch(file, '*ktwo**.dat'):
+					lc.append(file)
+			else:
+				if fnmatch.fnmatch(file, '*kplr**.dat'):
+					lc.append(file)
+
+	choice=[]
+	for file in lc:
+		if sc==True:
+			if fnmatch.fnmatch(file, '*slc*'):
+				choice.append(file)
+		else:
+			if fnmatch.fnmatch(file, '*llc*'):
+				choice.append(file)
+	lc=choice
+	lc=np.sort(lc)
+	lc=lc[start:end]
+
+
+	for i in lc:
+		if fits==True:
+			datafile=pyfits.open(mypath+'/'+str(i))
+			lightdata=datafile[1].data
+			t=lightdata["TIME"]            #Barycenter corrected Julian date #Start with the PDCSAP_FLUX if  you're not sure which one to use.
+			f=lightdata["PDCSAP_FLUX"]
+			ef=lightdata["PDCSAP_FLUX_ERR"]
+		else:
+			t,f,ef=np.loadtxt(mypath+'/'+str(i),usecols=(0,3,4),unpack=True)
+
+		f[np.isfinite(f)==False]=np.nan
+		ef=ef/np.nanmedian(f)
+		f=(f/np.nanmedian(f))
+
+		finite=np.isfinite(f)
+		f=f[finite]
+		ef=ef[finite]
+		t=t[finite]
+		if median==True:
+			med=med_filt(t,f,dt)
+			f=1e6*((f/med)-1)
+		else:
+			f=1e6*(f-1)
+		ef=1e6*ef
+		##############################################################
+
+		if i == lc[0]:	
+			data=np.c_[t,f,ef]
+
+		else:
+			data1=np.c_[t,f,ef]
+			data=np.append(data,data1,axis=0)
+
+	idx=np.argsort(data[:,0])
+	data=data[idx]
+	time,flux,eflux=data.T
+	if clip==True:
+		print('Clip on')
+		time,flux,eflux=sigclip(time,flux,eflux,repeat=True,sigma=4)
+
+	return time,flux,eflux
+
+home=expanduser('~')
+#data location
+mypath=home+'/Dropbox/PhD/Year_4/Year_3_koi6194_kic9145861/Kepler_Lightcurve/9145861'
+
+time,flux,eflux=detrend(mypath,dt=30.,clip=True,median=True,fits=True,ktwo=False,sc=False)
+plt.plot(time,flux,'.')
+plt.show()
+
+
+
+data=pyfits.open(home+'/Dropbox/PhD/Year_4/Year_3_koi6194_kic9145861/kplr009145861_kasoc-psd_llc_v1.fits')
+fk,pk=data[1].data['Frequency'],data[1].data['PSD']
+f,p=ps(time,flux,Nf=1)
+bw=f[1]-f[0]
+bins=int(5/bw)
+
+f1=rebin(f,bins)[0]
+p1=rebin(p,bins)[0]
+
+plt.plot(fk,pk,'r',alpha=0.8)
+plt.plot(f,p/1e4,'k',alpha=0.8)
+plt.xlim(1,280)
+plt.xscale('log')
+plt.yscale('log')
+plt.xlabel('Frequency ($\mu$Hz)', fontsize=18)
+plt.ylabel('Power Spectral Density (ppm$^2\mu$Hz$^{-1}$)', fontsize=18)
+
+plt.tight_layout()
+plt.show()
+
+print(np.mean(flux),np.std(flux))
+print(np.mean(eflux),np.std(eflux))
+
+
+bls = BLS(time, flux, eflux, period_range=(40,45), q_range=(0.001, 0.1), nf=3000, nbin=3000)
+res=bls()
+periods,power=bls.period,bls.sde
+phase=bls.phase
+best_period=bls.result.bper
+depth=bls.result.depth
+duration=best_period*bls.result.qtran
+print(duration,'days')
+print('a/R=',best_period/(duration*np.pi))
+T0=bls.tc
+print('Best period (days): ',best_period, 'T0',T0)
+
+bls_periods=np.arange(1,10,1)*(1e6/(86400*best_period))
+
+plt.plot(periods,power,'k')
+plt.xlabel('Periods (days)',fontsize=18)
+plt.tight_layout()
+plt.show()
+print('Results')
+print(res)
+
+
+plt.plot(phase,flux,'.')
+plt.show()
+
+
+#np.savetxt('Detrended_full.txt',np.c_[time,flux,eflux,phase],header='#BJD -2454833')
+idx=[np.abs(phase)<0.2]
+#np.savetxt('Detrended_phase0.2.txt',np.c_[time[idx],flux[idx],eflux[idx],phase[idx]],header='#BJD -2454833')
+
+
+
+trantime=np.arange(T0,max(time),best_period)#transit times
+plt.subplot(211)
+plt.plot(time,flux,'k.',alpha=0.2)
+plt.vlines(trantime,min(flux),max(flux),linestyle='--',color='r')
+plt.xlabel('BJD-2454833 (days)')
+plt.ylabel('Flux (ppm)')
+
+idx=np.argsort(phase)
+
+ph=phase[idx]
+phf=flux[idx]
+
+ph=rebin(ph,50)[0]
+phf=rebin(phf,50)[0]
+
+plt.subplot(212)
+plt.plot(phase,flux,'k,',alpha=0.2)
+plt.plot(ph,phf,'b+')
+plt.xlim(-0.25,0.25)
+plt.xlabel('Phase')
+plt.ylabel('Flux (ppm)')
+
+plt.savefig(home+'/Dropbox/PhD/Year_4/Thesis/Chapters/Hosts/Phase_folded.pdf')
+#plt.savefig('/home/thomas/Dropbox/PhD/Written Papers/Exoplanet_Host_KOI_6194/Phase_folded.pdf')
+plt.tight_layout()
+plt.show()
+
+np.savetxt(home+'/Dropbox/PhD/Year_4/Year_3_koi6194_kic9145861/Detrended_full.txt',np.c_[time,flux,eflux])
+
+###############
+data=np.c_[time,flux,eflux,phase]
+data=data[idx]
+time,flux,eflux,phase=data.T
+
+idx=np.where((phase<0.2) & (phase>-0.2))[0]
+data=np.c_[time,flux,eflux,phase]
+data=data[idx]
+time,flux,eflux,phase=data.T
+
+idx=np.argsort(time)
+data=np.c_[time,flux,eflux,phase]
+data=data[idx]
+time,flux,eflux,phase=data.T
+np.savetxt(home+'/Dropbox/PhD/Year_4/Year_3_koi6194_kic9145861/Detrended_0.2.txt',np.c_[time,flux,eflux])
+
+plt.plot(phase,flux,'.')
+plt.show()
+
+
+

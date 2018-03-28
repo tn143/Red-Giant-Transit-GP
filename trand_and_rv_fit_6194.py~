@@ -1,0 +1,285 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+from __future__ import print_function,division
+import emcee
+import corner
+import numpy as np
+import scipy.optimize as op
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+import corner
+from os.path import expanduser
+import sys
+from scipy import stats
+import batman
+import pandas as pd
+import gatspy.periodic as gp
+from scipy.optimize import fsolve
+from scipy import optimize
+from tqdm import tqdm
+from time import sleep
+
+home=expanduser('~')
+#need period, ecc, time, w, rvsys, t0
+#tan(f/2)=np.sqrt((1+e)/(1-e))*tan(E/2)
+#n=(2*np.pi)/period
+#E-(e*np.sin(E))=n(time-T)
+#v=rvsys+K*(np.cos(f+w)+e*np.cos(w))
+def rv_pl(params,time):
+	rvsys, K, w, ecc, T, period=params
+	w=np.radians(w)
+	n=(2*np.pi)/period
+	M=n*(time-T)
+	E=np.zeros(len(M))
+
+	for ii,element in enumerate(M): # compute eccentric anomaly
+		E[ii] = fsolve(lambda x: element- x+ecc*np.sin(x) ,element)
+	#E= fsolve(lambda x: x-ecc*np.sin(x) - M,M)#slower for N >~230
+
+	f=2*np.arctan2(np.sqrt((1+ecc))*np.sin(0.5*E),np.sqrt(1-ecc)*np.cos(0.5*E))
+
+	V=rvsys+K*(np.cos(w+f)+(ecc*np.cos(w)))
+	return V
+
+def get_rv(params,time):
+	if fix_ecc:
+		P,Tc,ars,rprs,inc, rvsys, K, Tr = params
+		ecc=globale
+		w=globalw		
+	else:
+		P,Tc,ars,rprs,inc,rvsys,K, Tr, ecc,w = params
+
+
+	w=np.radians(w)
+	n=(2*np.pi)/P
+	M=n*(time-Tr)
+	E=np.zeros(len(M))
+
+	for ii,element in enumerate(M): # compute eccentric anomaly
+		E[ii] = fsolve(lambda x: element- x+ecc*np.sin(x) ,element)
+	#E= fsolve(lambda x: x-ecc*np.sin(x) - M,M)#slower for N >~230
+
+	f=2*np.arctan2(np.sqrt((1+ecc))*np.sin(0.5*E),np.sqrt(1-ecc)*np.cos(0.5*E))
+
+	V=rvsys+K*(np.cos(w+f)+(ecc*np.cos(w)))
+	return V
+
+def get_tran(para,timetran):
+	if fix_ecc:
+		P,Tc,ars,rprs,inc, rvsys, K, Tr = para
+	else:
+		P,Tc,ars,rprs,inc,rvsys,K, Tr, e,w = para
+
+	params.t0 = Tc 				#time of inferior conjunction 
+	params.per = P				#orbital period	
+	params.rp = rprs				#planet radius (in units of stellar radii)
+	params.a = ars				#semi-major axis (in units of stellar radii)
+	params.inc = inc			#orbital inclination (in degrees)	
+	params.u = [0.5839,0.1359] 	      	        #limb darkening coefficients
+	params.limb_dark = "quadratic"          #limb darkening model
+	if fix_ecc:
+		params.ecc = globale				#eccentricity	
+		params.w = globalw				#longitude of periastron (in degrees) 
+	else:
+		params.ecc=e
+		params.w=w
+
+	m=batman.TransitModel(params,timetran)#,supersample_factor=5, exp_time=0.5/24.)
+	model=m.light_curve(params)
+	model=1e6*(model-1)
+	return model
+
+def lnlike(theta, time, lc, elc, time_rv, rv, erv):
+	if fix_ecc:
+		P,Tc,ars,rprs,inc, rvsys, K, Tr = theta
+	else:
+		P,Tc,ars,rprs,inc,rvsys,K, Tr, ecc,w = theta
+
+	model =get_tran(theta,time)
+	inv_sigma2 = 1.0/(elc**2)
+	loglike_tran= -0.5*(np.sum((lc-model)**2*inv_sigma2 - np.log(inv_sigma2)))
+
+	modelrv =get_rv(theta,time_rv)
+	inv_sigma2 = 1.0/(erv**2)# + model**2)
+	loglike_rv= -0.5*(np.sum((rv-modelrv)**2*inv_sigma2 - np.log(inv_sigma2)))
+
+	return loglike_tran+loglike_rv
+
+
+def lnprob(theta, time, lc, elc, time_rv, rv, erv,iniguess):
+	lp = lnprior(theta,iniguess)
+	if not np.isfinite(lp):
+		return -np.inf
+	return lp + lnlike(theta, time, lc, elc, time_rv, rv, erv)
+
+
+def lnprior(theta,guess):
+	if fix_ecc:
+		P,Tc,ars,rprs,inc, rvsys, K, Tr = theta
+	else:
+		P,Tc,ars,rprs,inc,rvsys,K, Tr, ecc,w = theta
+
+	#initial=[42.297,Tci,ars,rprsi,88,10,40,T0i,90,0.2]
+	ln_rvsys=stats.uniform(0,100)
+	ln_k=stats.uniform(0,500)
+	ln_T=stats.uniform(0,1200)
+	ln_Per=stats.uniform(0,365)
+	ln_ars=stats.uniform(0.5*guess[2],2*guess[2])
+	ln_rprs=stats.uniform(0.5*guess[3],2*guess[3])
+	ln_inc=stats.uniform(80,90)
+
+
+	logprior_rv=ln_rvsys.logpdf(rvsys)+ln_k.logpdf(K)+ln_T.logpdf(Tr)+ln_Per.logpdf(P)
+	logprior_tran=ln_ars.logpdf(ars)+ln_rprs.logpdf(rprs)+ln_inc.logpdf(inc)+ln_T.logpdf(Tc)
+	logprior=logprior_tran+logprior_rv
+	if fix_ecc:
+		ln_w=stats.uniform(0,360)
+		ln_e=stats.beta(0.867,3.03)
+		logprior=logprior+ln_e.logpdf(ecc)+ln_w.logpdf(w)
+	return logprior
+
+def fold(time,period,T0):
+	return (((time-T0)/(period)) + 0.5)%1 -0.5
+
+####################################################
+###################################################
+if __name__ == "__main__":
+
+	#GLOBALS
+	params = batman.TransitParams()       #object to store transit parameters
+	#Fix ecc
+	fix_ecc=False
+	globale=0.0
+	globalw=90
+	labels=['P','Tc','a/R','Rp/R','inc','rvsys', 'K', 'T0','ecc','w']
+
+	folder='/home/thomas/Dropbox/PhD/Year_3/Year_3_koi6194_kic9145861/tran_rv_fit/'
+	#############~Data
+	KIC=9145861
+	#Astero
+	numax,enumax,delnu,edelnu,teff,eteff=133.6,0.4,10.9,0.7,4994,50
+	radius=(numax/3090)*((delnu/135.1)**(-2))*(teff/5777)**(0.5)
+	mass=((numax/3090)**(3))*((delnu/135.1)**(-4))*(teff/5777)**(1.5)
+	evm2=(enumax/numax)**2 #+ (30/3090)**2
+	edel2=(edelnu/delnu)**2 #+ (0.1/134.9)**2
+	eT2=(eteff/teff)**2 #+ (50/5777)**2
+	em=mass*np.sqrt(evm2+(4*edel2)+(0.5**2 * eT2))
+	er=radius*np.sqrt((9*evm2)+(16*edel2)+(1.5**2 * eT2))
+	print('KIC:',KIC)
+	print('Mass:',mass,' pm ',em)
+	print('Radius:',radius,' pm ',er)
+
+	#Transits
+	tran=pd.read_csv('Detrended_lightcurve_6194.txt',delim_whitespace=True,header=None,names=['time','flux','eflux','phase'])#ppm (time,flux,eflux,phase)
+	tran=tran[np.abs(tran['phase'])<0.1]
+	timet,flux,eflux,phaset=tran.values.T
+	#BLS Results
+	#Power 27.532067   sde  9.725   Period 42.297   Freq  0.024   Depth 214.158   qtran 0.017
+
+	#RV
+	#rvsys, K, w, ecc, T, period
+	initialrv=10,45,90,0.0,25,42.297
+
+	#Synthetic
+	timerv=np.random.randint(0,90,10)#50 observations over 4 years in days
+	timerv=np.sort(timerv)
+	mod_time=np.linspace(0,90,1e4)
+	rv=rv_pl(initialrv,timerv)#generate rv curve
+	erv=np.random.normal(8,2,len(rv))#random errors ~8ms 
+	rv+=np.random.normal(0,8,len(rv))#and random scatter of same level
+	##############################
+	plt.subplot(211)
+	plt.plot(phaset,flux,'.')
+	plt.subplot(212)
+	plt.errorbar(timerv,rv,yerr=erv,fmt='.')
+	plt.plot(mod_time,rv_pl(initialrv,mod_time))
+	plt.savefig('lc_rv.png',dpi=250)
+	plt.show()
+
+	############Initial guesses
+	#['P','Tc','a/R','Rp/R','inc','rvsys', 'K', 'T0','ecc','w']
+	Tci=timet[flux==min(flux)]
+	rprsi=np.sqrt(214.158/1e6)
+	ars=1/(np.pi*0.017)
+	T0i=timerv[rv==min(rv)]
+	if fix_ecc==True:
+		T0i=Tci
+	initial=[42.297,Tci,ars,rprsi,89.5,10,40,T0i,0.2,90]
+	print(np.c_[labels,initial])
+	if fix_ecc==True:
+		labels=labels[:-2]
+		initial=initial[:-2]
+
+	mi=get_tran(initial,timet)
+	ph=fold(timet,initial[0],initial[1])
+	idx=np.argsort(ph)
+	ph=ph[idx]
+	mipg=mi[idx]	
+
+	plt.subplot(211)
+	plt.plot(timet,flux,'.')
+	plt.plot(timet,mi)
+	plt.subplot(212)
+	plt.errorbar(timerv,rv,yerr=erv,fmt='.')
+	plt.plot(mod_time,rv_pl(initialrv,mod_time))
+	plt.savefig(folder+'Initial.png',dpi=250)
+	plt.show()
+
+
+	#########################~MCMC~##############################################################
+	ntemps, nwalkers, niter, ndim = 2, 100, 1000, len(labels)
+	sampler = emcee.PTSampler(ntemps, nwalkers, ndim, lnlike, lnprior, loglargs=(timet, flux, eflux,timerv,rv,erv),logpargs=(initial,))
+
+	p0 = np.zeros([ntemps, nwalkers, ndim])
+	for i in range(ntemps):
+		for j in range(nwalkers):
+			p0[i,j,:] = initial + 1e-2*np.random.randn(ndim)
+
+	print('... burning in ...')
+	for p, lnprob, lnlike in tqdm(sampler.sample(p0, iterations=niter),total=niter):
+		sleep(0.001)
+
+	# Clear and run the production chain.
+	sampler.reset()
+	print('... running sampler ...')
+	for p, lnprob, lnlike in tqdm(sampler.sample(p, lnprob0=lnprob,lnlike0=lnlike,iterations=niter),total=niter):
+			sleep(0.001)
+
+
+	fig, axes = plt.subplots(len(labels), 1, sharex=True, figsize=(8, 9))
+
+	for i in range(0,len(initial)):
+		axes[i].plot(sampler.chain[0, :, :, i].T, color="k", alpha=0.4)
+		axes[i].yaxis.set_major_locator(MaxNLocator(5))
+		axes[i].set_ylabel(labels[i])
+
+	fig.tight_layout(h_pad=0.0)
+	fig.savefig(folder+"t+rv_chains.png")
+	plt.show()
+	#print('n temps:', ntemps, "log evidence: ", sampler.thermodynamic_integration_log_evidence())
+
+	# Make the corner plot.
+	samples = sampler.chain[0, :, :, :].reshape((-1, ndim))
+
+
+	fig = corner.corner(samples, labels=labels)
+	fig.savefig(folder+"t+rv_corner.png")
+	plt.show()
+
+	quantiles = np.percentile(samples,[16,50,84],axis=0).T 
+	medians,uerr,lerr=quantiles[:,1],quantiles[:,2]-quantiles[:,1],quantiles[:,1]-quantiles[:,0]#median,+/-
+	np.savetxt(folder+'TRAN+RV_results.txt',np.c_[np.array(labels),medians,uerr,lerr],fmt='%s',header='Param,median,uerr,lerr')
+	for i in range(0,len(labels)):
+		print(labels[i],medians[i],'+/-',np.mean((uerr[i],lerr[i])))
+
+	if fix_ecc:
+		P,Tc,ars,rprs,inc, rvsys, K, Tr = medians
+	else:
+		P,Tc,ars,rprs,inc,rvsys,K, Tr, e,w = medians
+
+
+
+
+
+
+
